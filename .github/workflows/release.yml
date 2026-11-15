@@ -151,7 +151,7 @@ jobs:
       - name: Upload npm platform package
         uses: actions/upload-artifact@v4
         with:
-          name: npm-${{ matrix.target }}
+          name: npm-${{ matrix.package }}
           path: src/npm/${{ matrix.package }}
           if-no-files-found: error
 
@@ -171,7 +171,6 @@ jobs:
         with:
           path: dist
           pattern: npm-*
-          merge-multiple: true
 
       - name: Verify packages
         shell: bash
@@ -182,12 +181,12 @@ jobs:
           test -f bin/onenote.js
           for package in teams-win32-x64 teams-win32-arm64 teams-darwin-x64 \
                          teams-darwin-arm64 teams-linux-x64 teams-linux-arm64; do
-            if [ ! -f "dist/$package/package.json" ]; then
-              echo "missing dist/$package/package.json" >&2
+            if [ ! -f "dist/npm-$package/package.json" ]; then
+              echo "missing dist/npm-$package/package.json" >&2
               exit 1
             fi
-            if [ ! -d "dist/$package/bin" ]; then
-              echo "missing dist/$package/bin" >&2
+            if [ ! -d "dist/npm-$package/bin" ]; then
+              echo "missing dist/npm-$package/bin" >&2
               exit 1
             fi
           done
@@ -210,7 +209,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
-          for dir in dist/teams-*; do
+          for dir in dist/npm-teams-*; do
             echo "publishing $(basename "$dir")"
             ( cd "$dir" && npm publish --access public )
           done
