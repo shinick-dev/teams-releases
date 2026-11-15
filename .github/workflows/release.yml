@@ -208,12 +208,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          # The token is only written to an ephemeral runner's ~/.npmrc.
+          # GitHub masks secret values in logs; nothing echoes it here.
+          umask 077
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > ~/.npmrc
+
+          publish_if_new() {
+            local dir="$1"
+            local name version
+            name=$(node -p "require('./${dir}/package.json').name")
+            version=$(node -p "require('./${dir}/package.json').version")
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "skip ${name}@${version} (already published)"
+            else
+              echo "publishing ${name}@${version}"
+              ( cd "$dir" && npm publish --access public )
+            fi
+          }
+
           for dir in dist/npm-teams-*; do
-            echo "publishing $(basename "$dir")"
-            ( cd "$dir" && npm publish --access public )
+            publish_if_new "$dir"
           done
-          npm publish --access public
+          publish_if_new "."
 
   release:
     name: create GitHub release
