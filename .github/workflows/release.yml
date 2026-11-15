@@ -1,0 +1,246 @@
+name: Release
+
+# Builds the six platform binaries from the PRIVATE source repository and
+# publishes them as GitHub release assets here. This repository exists only so
+# the build runs on GitHub-hosted runners; the source stays private and the
+# workflow checks it out with the SOURCE_REPO_TOKEN secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Source tag in shinick-dev/teams to build
+        required: true
+        default: v0.3.0
+      release_name:
+        description: Release title
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SOURCE_REPO: shinick-dev/teams
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            package: teams-win32-x64
+            binary: teams.exe
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            package: teams-win32-arm64
+            binary: teams.exe
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar.gz
+            package: teams-darwin-x64
+            binary: teams
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+            package: teams-darwin-arm64
+            binary: teams
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            package: teams-linux-x64
+            binary: teams
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            package: teams-linux-arm64
+            binary: teams
+    steps:
+      - name: Check out private source at the requested tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ inputs.tag }}
+          path: src
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get -y install pkg-config libdbus-1-dev
+
+      - name: Install Linux ARM64 cross toolchain and target headers
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo dpkg --add-architecture arm64
+          # Keep amd64-only sources as they are, then add an arm64 view.
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list || true
+          sudo find /etc/apt/sources.list.d -name '*.sources' -exec \
+            sed -i 's/^URIs: http:\/\/archive.ubuntu.com\/ubuntu/URIs: http:\/\/ports.ubuntu.com\/ubuntu-ports/' {} + || true
+          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main universe' \
+            | sudo tee /etc/apt/sources.list.d/arm64.list >/dev/null
+          sudo apt-get update
+          sudo apt-get -y install gcc-aarch64-linux-gnu
+          sudo apt-get -y install libdbus-1-dev:arm64 || echo "arm64 dbus headers unavailable; relying on PKG_CONFIG_PATH"
+
+      - name: Build release binary
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          PKG_CONFIG_SYSROOT_DIR: /
+        run: |
+          set -euo pipefail
+          cd src
+          cargo build --release --target ${{ matrix.target }}
+          ls -la "$CARGO_TARGET_DIR/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+      - name: Stage binary into the npm platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          node scripts/build-npm.mjs --target ${{ matrix.target }}
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./src/package.json').version")
+          name="teams-${version}-${{ matrix.target }}"
+          mkdir -p release-staging
+          bin="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "release-staging/${name}.zip" "$bin" >/dev/null
+            cp "$bin" release-staging/teams.exe
+          else
+            tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
+          fi
+          ls -la release-staging
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: release-staging/*
+          if-no-files-found: error
+
+      - name: Upload npm platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.target }}
+          path: src/npm/${{ matrix.package }}
+          if-no-files-found: error
+
+  publish-npm:
+    name: publish npm platform packages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: npm-*
+          merge-multiple: true
+
+      - name: Verify packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          node scripts/sync-version.mjs --check
+          test -f bin/onenote.js
+          for package in teams-win32-x64 teams-win32-arm64 teams-darwin-x64 \
+                         teams-darwin-arm64 teams-linux-x64 teams-linux-arm64; do
+            if [ ! -f "dist/$package/package.json" ]; then
+              echo "missing dist/$package/package.json" >&2
+              exit 1
+            fi
+            if [ ! -d "dist/$package/bin" ]; then
+              echo "missing dist/$package/bin" >&2
+              exit 1
+            fi
+          done
+          echo "all six platform packages staged for version $version"
+
+      - name: Detect npm token
+        id: npm
+        shell: bash
+        run: |
+          if [ -n "${NPM_TOKEN}" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish
+        if: steps.npm.outputs.present == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          for dir in dist/teams-*; do
+            echo "publishing $(basename "$dir")"
+            ( cd "$dir" && npm publish --access public )
+          done
+          npm publish --access public
+
+  release:
+    name: create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.release_name != '' && inputs.release_name || format('teams / outlook / onenote {0}', inputs.tag) }}
+          body: |
+            Single unified binary (`teams` / `teams.exe`) powers `teams`, `outlook` (`TEAMS_PERSONA=outlook`), and `onenote` (`TEAMS_PERSONA=onenote`).
+
+            Built from `${{ env.SOURCE_REPO }}` at `${{ inputs.tag }}`.
+          files: release-assets/*
+          fail_on_unmatched_files: true
