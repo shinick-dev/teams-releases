@@ -10,7 +10,7 @@ on:
       tag:
         description: Source tag in shinick-dev/teams to build
         required: true
-        default: v0.4.0
+        default: v0.6.0
       release_name:
         description: Release title
         required: false
@@ -193,7 +193,8 @@ jobs:
           version=$(node -p "require('./package.json').version")
           node scripts/verify-glibc.mjs --self-test
           node scripts/sync-version.mjs --check
-          test -f bin/onenote.js
+          test -f bin/teams.js
+          test -f scripts/postinstall.mjs
           for package in teams-win32-x64 teams-win32-arm64 teams-darwin-x64 \
                          teams-darwin-arm64 teams-linux-x64 teams-linux-arm64; do
             if [ ! -f "dist/npm-$package/package.json" ]; then
@@ -277,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo 'Single unified binary (`teams` / `teams.exe`) powers `teams`, `outlook` (`TEAMS_PERSONA=outlook`), and `onenote` (`TEAMS_PERSONA=onenote`).'
+            echo 'Prebuilt pure Microsoft Teams binary (`teams` / `teams.exe`) — CLI, TUI, HTTP API, and MCP server.'
             echo ""
             echo "Built from \`${SOURCE_REPO}\` at \`${{ inputs.tag }}\` (Linux \`x86_64\` & \`aarch64\` built against \`GLIBC 2.28\` for AlmaLinux 8 / RHEL 8+)."
             if [ -f "src/release-notes/${{ inputs.tag }}.md" ]; then
@@ -290,7 +291,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
-          name: ${{ inputs.release_name != '' && inputs.release_name || format('teams / outlook / onenote {0}', inputs.tag) }}
+          name: ${{ inputs.release_name != '' && inputs.release_name || format('teams {0}', inputs.tag) }}
           body_path: release-body.md
           files: release-assets/*
           fail_on_unmatched_files: true
