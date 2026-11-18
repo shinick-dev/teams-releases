@@ -1,0 +1,301 @@
+name: Release Outlook
+
+# Builds the six platform binaries from the PRIVATE shinick-dev/outlook repository and
+# publishes them to npm (@shinick/outlook + platform packages) and shinick-dev/outlook-releases.
+# Linux binaries are built via cargo-zigbuild against GLIBC 2.28 (AlmaLinux 8 / RHEL 8+).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Source tag in shinick-dev/outlook to build
+        required: true
+        default: v0.1.0
+      release_name:
+        description: Release title
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SOURCE_REPO: shinick-dev/outlook
+  RELEASE_REPO: shinick-dev/outlook-releases
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            package: outlook-win32-x64
+            binary: outlook.exe
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            package: outlook-win32-arm64
+            binary: outlook.exe
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar.gz
+            package: outlook-darwin-x64
+            binary: outlook
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+            package: outlook-darwin-arm64
+            binary: outlook
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            package: outlook-linux-x64
+            binary: outlook
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            package: outlook-linux-arm64
+            binary: outlook
+    steps:
+      - name: Check out private source at the requested tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ inputs.tag }}
+          path: src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig (for GLIBC 2.28 Linux builds)
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Build release binary (Linux GLIBC 2.28 via cargo-zigbuild)
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          cargo zigbuild --release --target ${{ matrix.target }}.2.28
+          ls -la "$CARGO_TARGET_DIR/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+      - name: Verify Linux GLIBC <= 2.28 compatibility
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          node scripts/verify-glibc.mjs "$CARGO_TARGET_DIR/${{ matrix.target }}/release/${{ matrix.binary }}" --max 2.28
+
+      - name: Smoke test binary on AlmaLinux 8 container
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/outlook --version
+          docker run --rm -v "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/outlook --help >/dev/null
+
+      - name: Build release binary (Windows / macOS)
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          cargo build --release --target ${{ matrix.target }}
+          ls -la "$CARGO_TARGET_DIR/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+      - name: Stage binary into the npm platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          node scripts/build-npm.mjs --target ${{ matrix.target }}
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./src/package.json').version")
+          name="outlook-${version}-${{ matrix.target }}"
+          mkdir -p release-staging
+          bin="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "release-staging/${name}.zip" "$bin" >/dev/null
+            if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+              cp "$bin" release-staging/outlook.exe
+            fi
+          else
+            tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
+          fi
+          ls -la release-staging
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: release-staging/*
+          if-no-files-found: error
+
+      - name: Upload npm platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.package }}
+          path: src/npm/${{ matrix.package }}
+          if-no-files-found: error
+
+  publish-npm:
+    name: publish npm platform packages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: npm-*
+
+      - name: Verify packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          node scripts/verify-glibc.mjs --self-test
+          node scripts/sync-version.mjs --check
+          test -f bin/outlook.js
+          test -f scripts/postinstall.mjs
+          for package in outlook-win32-x64 outlook-win32-arm64 outlook-darwin-x64 \
+                         outlook-darwin-arm64 outlook-linux-x64 outlook-linux-arm64; do
+            if [ ! -f "dist/npm-$package/package.json" ]; then
+              echo "missing dist/npm-$package/package.json" >&2
+              exit 1
+            fi
+            if [ ! -d "dist/npm-$package/bin" ]; then
+              echo "missing dist/npm-$package/bin" >&2
+              exit 1
+            fi
+          done
+          echo "all six platform packages staged for version $version"
+
+      - name: Detect npm token
+        id: npm
+        shell: bash
+        run: |
+          if [ -n "${NPM_TOKEN}" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish
+        if: steps.npm.outputs.present == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > ~/.npmrc
+
+          publish_if_new() {
+            local dir="$1"
+            local name version
+            name=$(node -p "require('./${dir}/package.json').name")
+            version=$(node -p "require('./${dir}/package.json').version")
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "skip ${name}@${version} (already published)"
+            else
+              echo "publishing ${name}@${version}"
+              ( cd "$dir" && npm publish --access public )
+            fi
+          }
+
+          for dir in dist/npm-outlook-*; do
+            publish_if_new "$dir"
+          done
+          publish_if_new "."
+
+  release:
+    name: create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out release notes from source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ inputs.tag }}
+          path: src
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Prepare release body
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'Prebuilt pure Microsoft Outlook binary (`outlook` / `outlook.exe`) — CLI, TUI, HTTP API, and MCP server.'
+            echo ""
+            echo "Built from \`${SOURCE_REPO}\` at \`${{ inputs.tag }}\` (Linux \`x86_64\` & \`aarch64\` built against \`GLIBC 2.28\` for AlmaLinux 8 / RHEL 8+)."
+            if [ -f "src/release-notes/${{ inputs.tag }}.md" ]; then
+              echo ""
+              cat "src/release-notes/${{ inputs.tag }}.md"
+            fi
+          } > release-body.md
+
+      - name: Publish GitHub release to outlook-releases
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.RELEASE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          tag_name: ${{ inputs.tag }}
+          target_commitish: main
+          name: ${{ inputs.release_name != '' && inputs.release_name || format('outlook {0}', inputs.tag) }}
+          body_path: release-body.md
+          files: release-assets/*
+          fail_on_unmatched_files: true
