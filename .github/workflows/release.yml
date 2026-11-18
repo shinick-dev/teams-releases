@@ -1,9 +1,8 @@
 name: Release
 
 # Builds the six platform binaries from the PRIVATE source repository and
-# publishes them as GitHub release assets here. This repository exists only so
-# the build runs on GitHub-hosted runners; the source stays private and the
-# workflow checks it out with the SOURCE_REPO_TOKEN secret.
+# publishes them as GitHub release assets here (plus npm @shinick/teams).
+# Linux binaries are built via cargo-zigbuild against GLIBC 2.28 (AlmaLinux 8 / RHEL 8+).
 
 on:
   workflow_dispatch:
@@ -11,7 +10,7 @@ on:
       tag:
         description: Source tag in shinick-dev/teams to build
         required: true
-        default: v0.3.0
+        default: v0.4.0
       release_name:
         description: Release title
         required: false
@@ -30,8 +29,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
-      # Job-level so the later "Stage binary into the npm platform package"
-      # step resolves the same target directory the build wrote to.
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     strategy:
       fail-fast: false
@@ -76,42 +73,53 @@ jobs:
           ref: ${{ inputs.tag }}
           path: src
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Linux build dependencies
+      - name: Install Zig (for GLIBC 2.28 Linux builds)
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Build release binary (Linux GLIBC 2.28 via cargo-zigbuild)
         if: startsWith(matrix.os, 'ubuntu')
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get -y install pkg-config libdbus-1-dev
+          cd src
+          cargo zigbuild --release --target ${{ matrix.target }}.2.28
+          ls -la "$CARGO_TARGET_DIR/${{ matrix.target }}/release/${{ matrix.binary }}"
 
-      - name: Install Linux ARM64 cross toolchain and target headers
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Verify Linux GLIBC <= 2.28 compatibility
+        if: startsWith(matrix.os, 'ubuntu')
         shell: bash
         run: |
           set -euo pipefail
-          sudo dpkg --add-architecture arm64
-          # Keep amd64-only sources as they are, then add an arm64 view.
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list || true
-          sudo find /etc/apt/sources.list.d -name '*.sources' -exec \
-            sed -i 's/^URIs: http:\/\/archive.ubuntu.com\/ubuntu/URIs: http:\/\/ports.ubuntu.com\/ubuntu-ports/' {} + || true
-          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main universe' \
-            | sudo tee /etc/apt/sources.list.d/arm64.list >/dev/null
-          sudo apt-get update
-          sudo apt-get -y install gcc-aarch64-linux-gnu
-          sudo apt-get -y install libdbus-1-dev:arm64 || echo "arm64 dbus headers unavailable; relying on PKG_CONFIG_PATH"
+          cd src
+          node scripts/verify-glibc.mjs "$CARGO_TARGET_DIR/${{ matrix.target }}/release/${{ matrix.binary }}" --max 2.28
 
-      - name: Build release binary
+      - name: Smoke test binary on AlmaLinux 8 container
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_ALLOW_CROSS: "1"
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
-          PKG_CONFIG_SYSROOT_DIR: /
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/teams --version
+          docker run --rm -v "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/teams --help >/dev/null
+
+      - name: Build release binary (Windows / macOS)
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
+        shell: bash
         run: |
           set -euo pipefail
           cd src
@@ -135,7 +143,9 @@ jobs:
           bin="target/${{ matrix.target }}/release/${{ matrix.binary }}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             7z a "release-staging/${name}.zip" "$bin" >/dev/null
-            cp "$bin" release-staging/teams.exe
+            if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+              cp "$bin" release-staging/teams.exe
+            fi
           else
             tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
           fi
@@ -167,6 +177,10 @@ jobs:
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           ref: ${{ inputs.tag }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -177,6 +191,7 @@ jobs:
         run: |
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
+          node scripts/verify-glibc.mjs --self-test
           node scripts/sync-version.mjs --check
           test -f bin/onenote.js
           for package in teams-win32-x64 teams-win32-arm64 teams-darwin-x64 \
@@ -208,8 +223,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The token is only written to an ephemeral runner's ~/.npmrc.
-          # GitHub masks secret values in logs; nothing echoes it here.
           umask 077
           printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > ~/.npmrc
 
@@ -237,6 +250,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Check out release notes from source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ inputs.tag }}
+          path: src
+
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -251,14 +272,25 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Prepare release body
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'Single unified binary (`teams` / `teams.exe`) powers `teams`, `outlook` (`TEAMS_PERSONA=outlook`), and `onenote` (`TEAMS_PERSONA=onenote`).'
+            echo ""
+            echo "Built from \`${SOURCE_REPO}\` at \`${{ inputs.tag }}\` (Linux \`x86_64\` & \`aarch64\` built against \`GLIBC 2.28\` for AlmaLinux 8 / RHEL 8+)."
+            if [ -f "src/release-notes/${{ inputs.tag }}.md" ]; then
+              echo ""
+              cat "src/release-notes/${{ inputs.tag }}.md"
+            fi
+          } > release-body.md
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.release_name != '' && inputs.release_name || format('teams / outlook / onenote {0}', inputs.tag) }}
-          body: |
-            Single unified binary (`teams` / `teams.exe`) powers `teams`, `outlook` (`TEAMS_PERSONA=outlook`), and `onenote` (`TEAMS_PERSONA=onenote`).
-
-            Built from `${{ env.SOURCE_REPO }}` at `${{ inputs.tag }}`.
+          body_path: release-body.md
           files: release-assets/*
           fail_on_unmatched_files: true
